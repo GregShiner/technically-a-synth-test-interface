@@ -1,10 +1,11 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use dasp_signal::Signal;
-use dsp::{saw_oscillator, sine_oscillator, square_oscillator};
+use dasp_signal::{ConstHz, Saw, Signal, Sine, Square};
+use dsp::Oscillator;
 use eframe::egui;
+use microfft::Complex32;
 use ringbuf::{
-    traits::{Consumer, Observer, Producer, Split},
     HeapRb,
+    traits::{Consumer, Observer, Producer, Split},
 };
 use std::sync::{Arc, Mutex};
 
@@ -16,12 +17,36 @@ const BUFFER_SIZE: usize = 1024;
 struct OscilloscopeApp {
     samples: Arc<Mutex<Vec<f32>>>,
     frequency: f64,
-    osc: Box<dyn Signal<Frame = f64>>,
+    osc: AnyOscillator,
     osc_type: OscillatorType,
     producer: ringbuf::HeapProd<f32>,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+pub enum AnyOscillator {
+    Sine(Oscillator<Sine<ConstHz>>),
+    Square(Oscillator<Square<ConstHz>>),
+    Saw(Oscillator<Saw<ConstHz>>),
+}
+
+impl AnyOscillator {
+    pub fn next_sample(&mut self) -> f32 {
+        match self {
+            AnyOscillator::Sine(o) => o.bus.send().next() as f32,
+            AnyOscillator::Square(o) => o.bus.send().next() as f32,
+            AnyOscillator::Saw(o) => o.bus.send().next() as f32,
+        }
+    }
+
+    pub fn fft_1024(&mut self) -> &mut [Complex32; 512] {
+        match self {
+            AnyOscillator::Sine(o) => o.fft_1024(),
+            AnyOscillator::Square(o) => o.fft_1024(),
+            AnyOscillator::Saw(o) => o.fft_1024(),
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum OscillatorType {
     Sine,
     Square,
@@ -29,11 +54,13 @@ enum OscillatorType {
 }
 
 impl OscillatorType {
-    fn build(&self, sample_rate: f64, freq: f64) -> Box<dyn Signal<Frame = f64>> {
+    fn build(&self, sample_rate: f64, freq: f64) -> AnyOscillator {
         match self {
-            OscillatorType::Sine => Box::new(sine_oscillator(sample_rate, freq)),
-            OscillatorType::Square => Box::new(square_oscillator(sample_rate, freq)),
-            OscillatorType::Saw => Box::new(saw_oscillator(sample_rate, freq)),
+            OscillatorType::Sine => AnyOscillator::Sine(Oscillator::new_sine(freq, sample_rate)),
+            OscillatorType::Square => {
+                AnyOscillator::Square(Oscillator::new_square(freq, sample_rate))
+            }
+            OscillatorType::Saw => AnyOscillator::Saw(Oscillator::new_saw(freq, sample_rate)),
         }
     }
 }
@@ -60,13 +87,14 @@ impl eframe::App for OscilloscopeApp {
 
             if self.osc_type != prev_type || self.frequency != prev_freq {
                 self.osc = self.osc_type.build(SAMPLE_RATE, self.frequency);
+                println!("Changing to {} {:?}", self.frequency, self.osc_type)
             }
 
             // Fill the ring buffer with fresh samples
             {
                 let mut buf = self.samples.lock().unwrap();
                 while self.producer.vacant_len() > 0 {
-                    let s = self.osc.next() as f32;
+                    let s = self.osc.next_sample();
                     self.producer.try_push(s).ok();
                     buf.rotate_left(1);
                     *buf.last_mut().unwrap() = s;
@@ -80,32 +108,62 @@ impl eframe::App for OscilloscopeApp {
                 egui::vec2(ui.available_width(), 300.0),
                 egui::Sense::hover(),
             );
+            draw_waveform(&painter, response.rect, &samples);
 
-            let rect = response.rect;
-            painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
-
-            if samples.len() > 1 {
-                let mid_y = rect.center().y;
-                let amplitude = rect.height() / 2.0 * 0.8;
-                let step = rect.width() / samples.len() as f32;
-
-                let points: Vec<egui::Pos2> = samples
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &s)| egui::pos2(rect.left() + i as f32 * step, mid_y - s * amplitude))
-                    .collect();
-
-                for window in points.windows(2) {
-                    painter.line_segment(
-                        [window[0], window[1]],
-                        egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 255, 100)),
-                    );
-                }
-            }
+            // --- FFT ---
+            // ui.label("Spectrum");
+            // let (response, painter) = ui.allocate_painter(
+            //     egui::vec2(ui.available_width(), 200.0),
+            //     egui::Sense::hover(),
+            // );
+            let spectrum = self.osc.fft_1024();
+            // let magnitudes: Vec<f32> = spectrum
+            //     .iter()
+            //     .map(|c| (c.re * c.re + c.im * c.im).sqrt())
+            //     .collect();
+            // draw_spectrum(&painter, response.rect, &magnitudes);
         });
 
-        // Continuously repaint so the oscilloscope updates
         ctx.request_repaint();
+    }
+}
+
+fn draw_waveform(painter: &egui::Painter, rect: egui::Rect, samples: &[f32]) {
+    painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
+    if samples.len() < 2 {
+        return;
+    }
+    let mid_y = rect.center().y;
+    let amplitude = rect.height() / 2.0 * 0.8;
+    let step = rect.width() / samples.len() as f32;
+    let points: Vec<egui::Pos2> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| egui::pos2(rect.left() + i as f32 * step, mid_y - s * amplitude))
+        .collect();
+    for window in points.windows(2) {
+        painter.line_segment(
+            [window[0], window[1]],
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 255, 100)),
+        );
+    }
+}
+
+fn draw_spectrum(painter: &egui::Painter, rect: egui::Rect, magnitudes: &[f32]) {
+    painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
+    let max = magnitudes.iter().cloned().fold(0.0f32, f32::max).max(1.0);
+    let bar_width = rect.width() / magnitudes.len() as f32;
+    for (i, &mag) in magnitudes.iter().enumerate() {
+        let height = (mag / max) * rect.height();
+        let x = rect.left() + i as f32 * bar_width;
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x, rect.bottom() - height),
+                egui::pos2(x + bar_width - 1.0, rect.bottom()),
+            ),
+            0.0,
+            egui::Color32::from_rgb(255, 100, 0),
+        );
     }
 }
 
@@ -123,7 +181,7 @@ fn main() {
     };
     // Set up a ring buffer between app and audio thread
     let rb = HeapRb::<f32>::new(BUFFER_SIZE * 4);
-    let (mut producer, mut consumer) = rb.split();
+    let (producer, mut consumer) = rb.split();
 
     let stream = device
         .build_output_stream(
@@ -158,8 +216,8 @@ fn main() {
             Ok(Box::new(OscilloscopeApp {
                 samples,
                 frequency: FREQUENCY,
-                osc: Box::new(sine_oscillator(SAMPLE_RATE, FREQUENCY)),
-                osc_type: OscillatorType::Sine,
+                osc: AnyOscillator::Saw(Oscillator::new_saw(FREQUENCY, SAMPLE_RATE)),
+                osc_type: OscillatorType::Saw,
                 producer,
             }))
         }),
