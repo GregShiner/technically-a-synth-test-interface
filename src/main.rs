@@ -1,6 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use dasp_signal::{ConstHz, Saw, Sine, Square};
-use dsp::Oscillator;
+use dsp::{FFTOscillator, Oscillator};
 use eframe::egui;
 use ringbuf::{
     HeapRb,
@@ -22,9 +22,9 @@ struct OscilloscopeApp {
 }
 
 pub enum AnyOscillator {
-    Sine(Oscillator<Sine<ConstHz>>),
-    Square(Oscillator<Square<ConstHz>>),
-    Saw(Oscillator<Saw<ConstHz>>),
+    Sine(FFTOscillator<Sine<ConstHz>>),
+    Square(FFTOscillator<Square<ConstHz>>),
+    Saw(FFTOscillator<Saw<ConstHz>>),
 }
 
 impl AnyOscillator {
@@ -38,9 +38,9 @@ impl AnyOscillator {
 
     pub fn real_fft_1024(&mut self) -> [f32; 512] {
         match self {
-            AnyOscillator::Sine(o) => o.real_fft_1024(),
-            AnyOscillator::Square(o) => o.real_fft_1024(),
-            AnyOscillator::Saw(o) => o.real_fft_1024(),
+            AnyOscillator::Sine(o) => o.fft_1024_magnitudes(),
+            AnyOscillator::Square(o) => o.fft_1024_magnitudes(),
+            AnyOscillator::Saw(o) => o.fft_1024_magnitudes(),
         }
     }
 }
@@ -55,11 +55,15 @@ enum OscillatorType {
 impl OscillatorType {
     fn build(&self, sample_rate: f64, freq: f64) -> AnyOscillator {
         match self {
-            OscillatorType::Sine => AnyOscillator::Sine(Oscillator::new_sine(freq, sample_rate)),
-            OscillatorType::Square => {
-                AnyOscillator::Square(Oscillator::new_square(freq, sample_rate))
+            OscillatorType::Sine => {
+                AnyOscillator::Sine(FFTOscillator::new(Oscillator::new_sine(freq, sample_rate)))
             }
-            OscillatorType::Saw => AnyOscillator::Saw(Oscillator::new_saw(freq, sample_rate)),
+            OscillatorType::Square => AnyOscillator::Square(FFTOscillator::new(
+                Oscillator::new_square(freq, sample_rate),
+            )),
+            OscillatorType::Saw => {
+                AnyOscillator::Saw(FFTOscillator::new(Oscillator::new_saw(freq, sample_rate)))
+            }
         }
     }
 }
@@ -96,7 +100,7 @@ impl eframe::App for OscilloscopeApp {
                     let s = self.osc.next_sample();
                     self.producer.try_push(s).ok();
                     buf.rotate_left(1);
-                    *buf.last_mut().unwrap() = s as f32;
+                    *buf.last_mut().unwrap() = s;
                 }
             }
 
@@ -211,7 +215,10 @@ fn main() {
             Ok(Box::new(OscilloscopeApp {
                 samples,
                 frequency: FREQUENCY,
-                osc: AnyOscillator::Sine(Oscillator::new_sine(FREQUENCY, SAMPLE_RATE)),
+                osc: AnyOscillator::Sine(FFTOscillator::new(Oscillator::new_sine(
+                    FREQUENCY,
+                    SAMPLE_RATE,
+                ))),
                 osc_type: OscillatorType::Sine,
                 producer,
             }))
